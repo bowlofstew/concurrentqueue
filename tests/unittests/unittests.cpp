@@ -9,18 +9,31 @@
 #include <cstring>
 #include <string>
 #include <cstddef>
+#include <string>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>		// Not because we need it, but to ensure no conflicts arise with the queue's declarations
+#endif
 
 #include "minitest.h"
 #include "../common/simplethread.h"
 #include "../common/systemtime.h"
 #include "../../concurrentqueue.h"
+#include "../../blockingconcurrentqueue.h"
 
 namespace {
 	struct tracking_allocator
 	{
 		union tag {
 			std::size_t size;
-			max_align_t dummy;
+#ifdef __GNUC__
+			max_align_t dummy;		// GCC forgot to add it to std:: for a while
+#else
+			std::max_align_t dummy;	// Others (e.g. MSVC) insist it can *only* be accessed via std::
+#endif
 		};
 		
 		static inline void* malloc(std::size_t size)
@@ -63,8 +76,14 @@ using namespace moodycamel;
 
 namespace moodycamel
 {
+struct MallocTrackingTraits : public ConcurrentQueueDefaultTraits
+{
+	static inline void* malloc(std::size_t size) { return tracking_allocator::malloc(size); }
+	static inline void free(void* ptr) { tracking_allocator::free(ptr); }
+};
+
 template<std::size_t BlockSize = ConcurrentQueueDefaultTraits::BLOCK_SIZE, std::size_t InitialIndexSize = ConcurrentQueueDefaultTraits::EXPLICIT_INITIAL_INDEX_SIZE>
-struct TestTraits : public ConcurrentQueueDefaultTraits
+struct TestTraits : public MallocTrackingTraits
 {
 	typedef std::size_t size_t;
 	typedef uint64_t index_t;
@@ -83,22 +102,16 @@ struct TestTraits : public ConcurrentQueueDefaultTraits
 	static inline void free(void* obj) { ++_free_count(); return tracking_allocator::free(obj); }
 };
 
-struct SmallIndexTraits : public ConcurrentQueueDefaultTraits
+struct SmallIndexTraits : public MallocTrackingTraits
 {
 	typedef uint16_t size_t;
 	typedef uint16_t index_t;
-	
-	static inline void* malloc(std::size_t size) { return tracking_allocator::malloc(size); }
-	static inline void free(void* ptr) { tracking_allocator::free(ptr); }
 };
 
-struct ExtraSmallIndexTraits : public ConcurrentQueueDefaultTraits
+struct ExtraSmallIndexTraits : public MallocTrackingTraits
 {
 	typedef uint8_t size_t;
 	typedef uint8_t index_t;
-	
-	static inline void* malloc(std::size_t size) { return tracking_allocator::malloc(size); }
-	static inline void free(void* ptr) { tracking_allocator::free(ptr); }
 };
 
 // Note: Not thread safe!
@@ -111,7 +124,7 @@ struct Foo
 	static void reset() { createCount() = 0; destroyCount() = 0; nextId() = 0; destroyedInOrder() = true; lastDestroyedId() = -1; }
 	
 	Foo() { id = nextId()++; ++createCount(); }
-	Foo(Foo const&) = delete;
+	Foo(Foo const&) MOODYCAMEL_DELETE_FUNCTION;
 	Foo(Foo&& other) { id = other.id; other.id = -1; }
 	void operator=(Foo&& other) { id = other.id; other.id = -1; }
 	~Foo()
@@ -145,12 +158,90 @@ struct Copyable {
 
 struct Moveable {
 	Moveable(int id) : moved(false), id(id) { }
-	Moveable(Moveable const&) = delete;
-	Moveable(Moveable&& o) : moved(true), id(o.id) { }
-	void operator=(Moveable const&) = delete;
-	void operator=(Moveable&& o) { moved = true; id = o.id; }
+	Moveable(Moveable&& o) MOODYCAMEL_NOEXCEPT : moved(true), id(o.id) { }
+	void operator=(Moveable&& o) MOODYCAMEL_NOEXCEPT { moved = true; id = o.id; }
 	bool moved;
 	int id;
+
+#if defined(_MSC_VER) && _MSC_VER < 1800
+	Moveable(Moveable const& o) MOODYCAMEL_NOEXCEPT : moved(o.moved), id(o.id) { }
+	void operator=(Moveable const& o) MOODYCAMEL_NOEXCEPT { moved = o.moved; id = o.id; }
+#else
+	Moveable(Moveable const&) MOODYCAMEL_DELETE_FUNCTION;
+	void operator=(Moveable const&) MOODYCAMEL_DELETE_FUNCTION;
+#endif
+};
+
+struct ThrowingMovable {
+	static std::atomic<int>& ctorCount() { static std::atomic<int> c; return c; }
+	static std::atomic<int>& destroyCount() { static std::atomic<int> c; return c; }
+	static void reset() { ctorCount() = 0; destroyCount() = 0; }
+	
+	explicit ThrowingMovable(int id, bool throwOnCctor = false, bool throwOnAssignment = false, bool throwOnSecondCctor = false)
+		: id(id), moved(false), copied(false), throwOnCctor(throwOnCctor), throwOnAssignment(throwOnAssignment), throwOnSecondCctor(throwOnSecondCctor)
+	{
+		ctorCount().fetch_add(1, std::memory_order_relaxed);
+	}
+	
+	ThrowingMovable(ThrowingMovable const& o)
+		: id(o.id), moved(false), copied(true), throwOnCctor(o.throwOnCctor), throwOnAssignment(o.throwOnAssignment), throwOnSecondCctor(false)
+	{
+		if (throwOnCctor) {
+			throw this;
+		}
+		ctorCount().fetch_add(1, std::memory_order_relaxed);
+		throwOnCctor = o.throwOnSecondCctor;
+	}
+	
+	ThrowingMovable(ThrowingMovable&& o)
+		: id(o.id), moved(true), copied(false), throwOnCctor(o.throwOnCctor), throwOnAssignment(o.throwOnAssignment), throwOnSecondCctor(false)
+	{
+		if (throwOnCctor) {
+			throw this;
+		}
+		ctorCount().fetch_add(1, std::memory_order_relaxed);
+		throwOnCctor = o.throwOnSecondCctor;
+	}
+	
+	~ThrowingMovable()
+	{
+		destroyCount().fetch_add(1, std::memory_order_relaxed);
+	}
+	
+	void operator=(ThrowingMovable const& o)
+	{
+		id = o.id;
+		moved = false;
+		copied = true;
+		throwOnCctor = o.throwOnCctor;
+		throwOnAssignment = o.throwOnAssignment;
+		throwOnSecondCctor = o.throwOnSecondCctor;
+		if (throwOnAssignment) {
+			throw this;
+		}
+	}
+	
+	void operator=(ThrowingMovable&& o)
+	{
+		id = o.id;
+		moved = true;
+		copied = false;
+		throwOnCctor = o.throwOnCctor;
+		throwOnAssignment = o.throwOnAssignment;
+		throwOnSecondCctor = o.throwOnSecondCctor;
+		if (throwOnAssignment) {
+			throw this;
+		}
+	}
+	
+	int id;
+	bool moved;
+	bool copied;
+	
+public:
+	bool throwOnCctor;
+	bool throwOnAssignment;
+	bool throwOnSecondCctor;
 };
 
 
@@ -182,16 +273,21 @@ public:
 		REGISTER_TEST(try_dequeue_bulk_threaded);
 		REGISTER_TEST(implicit_producer_hash);
 		REGISTER_TEST(index_wrapping);
+		REGISTER_TEST(subqueue_size_limit);
+		REGISTER_TEST(exceptions);
 		REGISTER_TEST(test_threaded);
 		REGISTER_TEST(test_threaded_bulk);
 		REGISTER_TEST(full_api<ConcurrentQueueDefaultTraits>);
 		REGISTER_TEST(full_api<SmallIndexTraits>);
+		REGISTER_TEST(blocking_wrappers);
 		
 		// Core algos
 		REGISTER_TEST(core_add_only_list);
 		REGISTER_TEST(core_thread_local);
 		REGISTER_TEST(core_free_list);
 		REGISTER_TEST(core_spmc_hash);
+		
+		REGISTER_TEST(explicit_strings_threaded);
 	}
 	
 	bool postTest(bool testSucceeded) override
@@ -206,14 +302,14 @@ public:
 	
 	bool create_empty_queue()
 	{
-		ConcurrentQueue<int> q;
+		ConcurrentQueue<int, MallocTrackingTraits> q;
 		return true;
 	}
 	
 	
 	bool create_token()
 	{
-		ConcurrentQueue<int> q;
+		ConcurrentQueue<int, MallocTrackingTraits> q;
 		ProducerToken tok(q);
 		
 		return true;
@@ -331,7 +427,7 @@ public:
 	
 	bool enqueue_one_explicit()
 	{
-		ConcurrentQueue<int> q;
+		ConcurrentQueue<int, MallocTrackingTraits> q;
 		ProducerToken tok(q);
 		
 		bool result = q.enqueue(tok, 17);
@@ -342,7 +438,7 @@ public:
 	
 	bool enqueue_and_dequeue_one_explicit()
 	{
-		ConcurrentQueue<int> q;
+		ConcurrentQueue<int, MallocTrackingTraits> q;
 		ProducerToken tok(q);
 		
 		int item = 0;
@@ -355,7 +451,7 @@ public:
 	
 	bool enqueue_one_implicit()
 	{
-		ConcurrentQueue<int> q;
+		ConcurrentQueue<int, MallocTrackingTraits> q;
 		
 		bool result = q.enqueue(17);
 		
@@ -365,7 +461,7 @@ public:
 	
 	bool enqueue_and_dequeue_one_implicit()
 	{
-		ConcurrentQueue<int> q;
+		ConcurrentQueue<int, MallocTrackingTraits> q;
 		
 		int item = 0;
 		ASSERT_OR_FAIL(q.enqueue(123));
@@ -1014,7 +1110,7 @@ public:
 			}
 		}
 		
-		ASSERT_OR_FAIL(Traits::malloc_count() == 11 || Traits::malloc_count() == 3);		// 2 for each producer (depending on thread ID re-use) + 1 for initial block pool
+		ASSERT_OR_FAIL(Traits::malloc_count() <= 11 && Traits::malloc_count() >= 3);		// 2 for each producer (depending on thread ID re-use) + 1 for initial block pool
 		ASSERT_OR_FAIL(Traits::free_count() == Traits::malloc_count());
 		
 		return true;
@@ -1023,9 +1119,10 @@ public:
 	bool producer_reuse()
 	{
 		typedef TestTraits<16> Traits;
-		Traits::reset();
 		
+		Traits::reset();
 		{
+			// Explicit
 			ConcurrentQueue<int, Traits> q;
 			
 			{
@@ -1062,6 +1159,104 @@ public:
 		
 		ASSERT_OR_FAIL(Traits::malloc_count() == 9);		// 2 for max number of live producers + 1 for initial block pool
 		ASSERT_OR_FAIL(Traits::free_count() == Traits::malloc_count());
+		
+#ifdef MOODYCAMEL_CPP11_THREAD_LOCAL_SUPPORTED
+		Traits::reset();
+		{
+			// Implicit
+			const int MAX_THREADS = 48;
+			ConcurrentQueue<int, Traits> q(Traits::BLOCK_SIZE * (MAX_THREADS + 1));
+			ASSERT_OR_FAIL(Traits::malloc_count() == 1);		// Initial block pool
+			
+			SimpleThread t0([&]() { q.enqueue(0); });
+			t0.join();
+			ASSERT_OR_FAIL(Traits::malloc_count() == 3);		// Implicit producer
+			
+			SimpleThread t1([&]() { q.enqueue(1); });
+			t1.join();
+			ASSERT_OR_FAIL(Traits::malloc_count() == 3);
+			
+			SimpleThread t2([&]() { q.enqueue(2); });
+			t2.join();
+			ASSERT_OR_FAIL(Traits::malloc_count() == 3);
+			
+			q.enqueue(3);
+			ASSERT_OR_FAIL(Traits::malloc_count() == 3);
+			
+			int item;
+			int i = 0;
+			while (q.try_dequeue(item)) {
+				ASSERT_OR_FAIL(item == i);
+				++i;
+			}
+			ASSERT_OR_FAIL(i == 4);
+			ASSERT_OR_FAIL(Traits::malloc_count() == 3);
+			
+			std::vector<SimpleThread> threads(MAX_THREADS);
+			for (int rep = 0; rep != 2; ++rep) {
+				for (std::size_t tid = 0; tid != threads.size(); ++tid) {
+					threads[tid] = SimpleThread([&](std::size_t tid) {
+						for (volatile int i = 0; i != 4096; ++i) {
+							continue;
+						}
+						q.enqueue((int)tid);
+						for (volatile int i = 0; i != 4096; ++i) {
+							continue;
+						}
+					}, tid);
+				}
+				for (std::size_t tid = 0; tid != threads.size(); ++tid) {
+					threads[tid].join();
+				}
+				std::vector<bool> seenIds(threads.size());
+				for (std::size_t i = 0; i != threads.size(); ++i) {
+					ASSERT_OR_FAIL(q.try_dequeue(item));
+					ASSERT_OR_FAIL(!seenIds[item]);
+					seenIds[item] = true;
+				}
+				for (std::size_t i = 0; i != seenIds.size(); ++i) {
+					ASSERT_OR_FAIL(seenIds[i]);
+				}
+				ASSERT_OR_FAIL(Traits::malloc_count() <= 2 * MAX_THREADS + 1);
+			}
+		}
+		ASSERT_OR_FAIL(Traits::free_count() == Traits::malloc_count());	
+		
+		
+		Traits::reset();
+		{
+			// Test many threads and implicit queues being created and destroyed concurrently
+			std::vector<SimpleThread> threads(32);
+			std::vector<bool> success(threads.size(), true);
+			for (std::size_t tid = 0; tid != threads.size(); ++tid) {
+				threads[tid] = SimpleThread([&](std::size_t tid) {
+					for (int i = 0; i != 5; ++i) {
+						ConcurrentQueue<int, MallocTrackingTraits> q(1);
+						q.enqueue(i);
+					}
+					
+					ConcurrentQueue<int, MallocTrackingTraits> q(15);
+					for (int i = 0; i != 100; ++i) {
+						q.enqueue(i);
+					}
+					int item;
+					for (int i = 0; i != 100; ++i) {
+						if (!q.try_dequeue(item) || item != i) {
+							success[tid] = false;
+						}
+					}
+					if (q.size_approx() != 0) {
+						success[tid] = false;
+					}
+				}, tid);
+			}
+			for (std::size_t tid = 0; tid != threads.size(); ++tid) {
+				threads[tid].join();
+				ASSERT_OR_FAIL(success[tid]);
+			}
+		}
+		ASSERT_OR_FAIL(Traits::free_count() == Traits::malloc_count());	
+#endif
 		
 		return true;
 	}
@@ -1458,7 +1653,7 @@ public:
 	
 	bool try_dequeue()
 	{
-		ConcurrentQueue<int> q;
+		ConcurrentQueue<int, MallocTrackingTraits> q;
 		int item;
 		
 		// Producer token
@@ -1545,7 +1740,7 @@ public:
 	bool try_dequeue_threaded()
 	{
 		int item;
-		ConcurrentQueue<int> q;
+		ConcurrentQueue<int, MallocTrackingTraits> q;
 		
 		// Threaded consumption with tokens
 		{
@@ -1910,7 +2105,7 @@ public:
 	bool implicit_producer_hash()
 	{
 		for (int j = 0; j != 5; ++j) {
-			ConcurrentQueue<int> q;
+			ConcurrentQueue<int, MallocTrackingTraits> q;
 			std::vector<SimpleThread> threads;
 			for (int i = 0; i != 20; ++i) {
 				threads.push_back(SimpleThread([&]() {
@@ -2001,6 +2196,697 @@ public:
 				ASSERT_OR_FAIL(item == i);
 			}
 			ASSERT_OR_FAIL(!q.try_dequeue(item));
+		}
+		
+		return true;
+	}
+	
+	struct SizeLimitTraits : public MallocTrackingTraits
+	{
+		static const size_t BLOCK_SIZE = 2;
+		static const size_t MAX_SUBQUEUE_SIZE = 5;		// Will round up to 6 because of block size
+	};
+	
+	bool subqueue_size_limit()
+	{
+		{
+			// Explicit
+			ConcurrentQueue<int, SizeLimitTraits> q;
+			ProducerToken t(q);
+			int item;
+			
+			ASSERT_OR_FAIL(q.enqueue(t, 1));
+			ASSERT_OR_FAIL(q.enqueue(t, 2));
+			ASSERT_OR_FAIL(q.enqueue(t, 3));
+			ASSERT_OR_FAIL(q.enqueue(t, 4));
+			ASSERT_OR_FAIL(q.enqueue(t, 5));
+			ASSERT_OR_FAIL(q.enqueue(t, 6));
+			ASSERT_OR_FAIL(!q.enqueue(t, 7));
+			ASSERT_OR_FAIL(!q.enqueue(t, 8));
+			
+			ASSERT_OR_FAIL(q.try_dequeue(item) && item == 1);
+			ASSERT_OR_FAIL(!q.enqueue(t, 7));		// Can't reuse block until it's completely empty
+			ASSERT_OR_FAIL(q.try_dequeue(item) && item == 2);
+			ASSERT_OR_FAIL(q.enqueue(t, 7));
+			ASSERT_OR_FAIL(q.enqueue(t, 8));
+			ASSERT_OR_FAIL(!q.enqueue(t, 9));
+			
+			ASSERT_OR_FAIL(q.try_dequeue(item) && item == 3);
+			ASSERT_OR_FAIL(!q.enqueue(t, 9));
+			ASSERT_OR_FAIL(q.try_dequeue(item) && item == 4);
+			ASSERT_OR_FAIL(q.enqueue(t, 9));
+			
+			for (int i = 5; i <= 9; ++i) {
+				ASSERT_OR_FAIL(q.try_dequeue(item) && item == i);
+			}
+			ASSERT_OR_FAIL(q.enqueue(t, 10));
+			ASSERT_OR_FAIL(q.try_dequeue(item) && item == 10);
+			ASSERT_OR_FAIL(!q.try_dequeue(item));
+			for (int i = 0; i != 6; ++i) {
+				ASSERT_OR_FAIL(q.try_enqueue(t, i));
+			}
+			ASSERT_OR_FAIL(!q.try_enqueue(t, 7));
+			ASSERT_OR_FAIL(!q.enqueue(t, 7));
+			
+			// Bulk
+			int items[6];
+			ASSERT_OR_FAIL(q.try_dequeue_bulk(items, 6) == 6);
+			ASSERT_OR_FAIL(!q.try_enqueue_bulk(t, items, 7));
+			ASSERT_OR_FAIL(!q.enqueue_bulk(t, items, 7));
+			ASSERT_OR_FAIL(q.enqueue_bulk(t, items, 6));
+			ASSERT_OR_FAIL(q.try_dequeue_bulk(items, 6) == 6);
+			ASSERT_OR_FAIL(q.enqueue_bulk(t, items, 3));
+			ASSERT_OR_FAIL(!q.enqueue_bulk(t, items, 4));
+			ASSERT_OR_FAIL(q.enqueue_bulk(t, items, 3));
+			ASSERT_OR_FAIL(!q.enqueue_bulk(t, items, 1));
+			ASSERT_OR_FAIL(!q.enqueue(t, 100));
+			ASSERT_OR_FAIL(q.try_dequeue_bulk(items, 1) == 1);
+			ASSERT_OR_FAIL(!q.enqueue(t, 100));
+		}
+		
+		{
+			// Implicit
+			ConcurrentQueue<int, SizeLimitTraits> q;
+			int item;
+			
+			ASSERT_OR_FAIL(q.enqueue(1));
+			ASSERT_OR_FAIL(q.enqueue(2));
+			ASSERT_OR_FAIL(q.enqueue(3));
+			ASSERT_OR_FAIL(q.enqueue(4));
+			ASSERT_OR_FAIL(q.enqueue(5));
+			ASSERT_OR_FAIL(q.enqueue(6));
+			ASSERT_OR_FAIL(!q.enqueue(7));
+			ASSERT_OR_FAIL(!q.enqueue(8));
+			
+			ASSERT_OR_FAIL(q.try_dequeue(item) && item == 1);
+			ASSERT_OR_FAIL(!q.enqueue(7));		// Can't reuse block until it's completely empty
+			ASSERT_OR_FAIL(q.try_dequeue(item) && item == 2);
+			ASSERT_OR_FAIL(q.enqueue(7));
+			ASSERT_OR_FAIL(q.enqueue(8));
+			ASSERT_OR_FAIL(!q.enqueue(9));
+			
+			ASSERT_OR_FAIL(q.try_dequeue(item) && item == 3);
+			ASSERT_OR_FAIL(!q.enqueue(9));
+			ASSERT_OR_FAIL(q.try_dequeue(item) && item == 4);
+			ASSERT_OR_FAIL(q.enqueue(9));
+			
+			for (int i = 5; i <= 9; ++i) {
+				ASSERT_OR_FAIL(q.try_dequeue(item) && item == i);
+			}
+			ASSERT_OR_FAIL(q.enqueue(10));
+			ASSERT_OR_FAIL(q.try_dequeue(item) && item == 10);
+			ASSERT_OR_FAIL(!q.try_dequeue(item));
+			for (int i = 0; i != 6; ++i) {
+				ASSERT_OR_FAIL(q.try_enqueue(i));
+			}
+			ASSERT_OR_FAIL(!q.try_enqueue(7));
+			ASSERT_OR_FAIL(!q.enqueue(7));
+			
+			// Bulk
+			int items[6];
+			ASSERT_OR_FAIL(q.try_dequeue_bulk(items, 6) == 6);
+			ASSERT_OR_FAIL(!q.try_enqueue_bulk(items, 7));
+			ASSERT_OR_FAIL(!q.enqueue_bulk(items, 7));
+			ASSERT_OR_FAIL(q.enqueue_bulk(items, 6));
+			ASSERT_OR_FAIL(q.try_dequeue_bulk(items, 6) == 6);
+			ASSERT_OR_FAIL(q.enqueue_bulk(items, 3));
+			ASSERT_OR_FAIL(!q.enqueue_bulk(items, 4));
+			ASSERT_OR_FAIL(q.enqueue_bulk(items, 3));
+			ASSERT_OR_FAIL(!q.enqueue_bulk(items, 1));
+			ASSERT_OR_FAIL(!q.enqueue(100));
+			ASSERT_OR_FAIL(q.try_dequeue_bulk(items, 1) == 1);
+			ASSERT_OR_FAIL(!q.enqueue(100));
+		}
+		
+		return true;
+	}
+	
+	bool exceptions()
+	{
+		typedef TestTraits<4, 2> Traits;
+		
+		{
+			// Explicit, basic
+			// enqueue
+			ConcurrentQueue<ThrowingMovable, Traits> q;
+			ProducerToken tok(q);
+			
+			ThrowingMovable::reset();
+			
+			bool threw = false;
+			try {
+				q.enqueue(tok, ThrowingMovable(1, true));
+			}
+			catch (ThrowingMovable* m) {
+				threw = true;
+				ASSERT_OR_FAIL(m->id == 1);
+				ASSERT_OR_FAIL(m->moved);
+			}
+			ASSERT_OR_FAIL(threw);
+			ASSERT_OR_FAIL(q.size_approx() == 0);
+			
+			ASSERT_OR_FAIL(q.enqueue(tok, ThrowingMovable(2)));
+			ThrowingMovable result(-1);
+			ASSERT_OR_FAIL(q.try_dequeue(result));
+			ASSERT_OR_FAIL(result.id == 2);
+			ASSERT_OR_FAIL(result.moved);
+			ASSERT_OR_FAIL(!q.try_dequeue(result));
+			
+			ASSERT_OR_FAIL(ThrowingMovable::destroyCount() == 3);
+			
+			// dequeue
+			ThrowingMovable::reset();
+			q.enqueue(tok, ThrowingMovable(10));
+			q.enqueue(tok, ThrowingMovable(11, false, true));
+			q.enqueue(tok, ThrowingMovable(12));
+			ASSERT_OR_FAIL(q.size_approx() == 3);
+			
+			ASSERT_OR_FAIL(q.try_dequeue(result));
+			ASSERT_OR_FAIL(result.id == 10);
+			threw = false;
+			try {
+				q.try_dequeue(result);
+			}
+			catch (ThrowingMovable* m) {
+				ASSERT_OR_FAIL(m->id == 11);
+				threw = true;
+			}
+			ASSERT_OR_FAIL(threw);
+			ASSERT_OR_FAIL(q.size_approx() == 1);
+			
+			ASSERT_OR_FAIL(q.try_dequeue(result));
+			ASSERT_OR_FAIL(result.id == 12);
+			ASSERT_OR_FAIL(result.moved);
+			
+			ASSERT_OR_FAIL(!q.try_dequeue(result));
+			q.enqueue(tok, ThrowingMovable(13));
+			ASSERT_OR_FAIL(q.size_approx() == 1);
+			ASSERT_OR_FAIL(q.try_dequeue(result));
+			ASSERT_OR_FAIL(result.id == 13);
+			ASSERT_OR_FAIL(!q.try_dequeue(result));
+			
+			ASSERT_OR_FAIL(ThrowingMovable::destroyCount() == 8);
+		}
+		
+		{
+			// Explicit, on and off block boundaries
+			// enqueue
+			ConcurrentQueue<ThrowingMovable, Traits> q;
+			ProducerToken tok(q);
+			
+			ThrowingMovable::reset();
+			
+			for (int i = 0; i != 3; ++i) {
+				q.enqueue(tok, ThrowingMovable(i));
+			}
+			bool threw = false;
+			try {
+				q.enqueue(tok, ThrowingMovable(3, true));
+			}
+			catch (ThrowingMovable* m) {
+				threw = true;
+				ASSERT_OR_FAIL(m->id == 3);
+			}
+			ASSERT_OR_FAIL(threw);
+			ASSERT_OR_FAIL(q.size_approx() == 3);
+			
+			q.enqueue(tok, ThrowingMovable(4));
+			threw = false;
+			try {
+				q.enqueue(tok, ThrowingMovable(5, true));
+			}
+			catch (ThrowingMovable* m) {
+				threw = true;
+				ASSERT_OR_FAIL(m->id == 5);
+				ASSERT_OR_FAIL(m->moved);
+			}
+			ASSERT_OR_FAIL(threw);
+			ASSERT_OR_FAIL(q.size_approx() == 4);
+			q.enqueue(tok, ThrowingMovable(6));
+			
+			ThrowingMovable result(-1);
+			ASSERT_OR_FAIL(q.try_dequeue(result));
+			ASSERT_OR_FAIL(result.id == 0);
+			ASSERT_OR_FAIL(q.try_dequeue(result));
+			ASSERT_OR_FAIL(result.id == 1);
+			ASSERT_OR_FAIL(q.try_dequeue(result));
+			ASSERT_OR_FAIL(result.id == 2);
+			ASSERT_OR_FAIL(q.try_dequeue(result));
+			ASSERT_OR_FAIL(result.id == 4);
+			ASSERT_OR_FAIL(q.try_dequeue(result));
+			ASSERT_OR_FAIL(result.id == 6);
+			ASSERT_OR_FAIL(!q.try_dequeue(result));
+			
+			ASSERT_OR_FAIL(ThrowingMovable::destroyCount() == 12);
+			
+			// dequeue
+			ThrowingMovable::reset();
+			q.enqueue(tok, ThrowingMovable(10, false, true));
+			q.enqueue(tok, ThrowingMovable(11));
+			q.enqueue(tok, ThrowingMovable(12));
+			q.enqueue(tok, ThrowingMovable(13, false, true));
+			q.enqueue(tok, ThrowingMovable(14, false, true));
+			q.enqueue(tok, ThrowingMovable(15, false, true));
+			q.enqueue(tok, ThrowingMovable(16));
+			ASSERT_OR_FAIL(q.size_approx() == 7);
+			
+			for (int i = 10; i != 17; ++i) {
+				if (i == 10 || (i >= 13 && i <= 15)) {
+					threw = false;
+					try {
+						q.try_dequeue(result);
+					}
+					catch (ThrowingMovable* m) {
+						ASSERT_OR_FAIL(m->id == i);
+						ASSERT_OR_FAIL(m->moved);
+						threw = true;
+					}
+					ASSERT_OR_FAIL(threw);
+				}
+				else {
+					ASSERT_OR_FAIL(q.try_dequeue(result));
+					ASSERT_OR_FAIL(result.id == i);
+					ASSERT_OR_FAIL(result.moved);
+				}
+				ASSERT_OR_FAIL(q.size_approx() == (std::uint32_t)(16 - i));
+			}
+			
+			ASSERT_OR_FAIL(!q.try_dequeue(result));
+			q.enqueue(tok, ThrowingMovable(20));
+			ASSERT_OR_FAIL(q.size_approx() == 1);
+			ASSERT_OR_FAIL(q.try_dequeue(result));
+			ASSERT_OR_FAIL(result.id == 20);
+			ASSERT_OR_FAIL(!q.try_dequeue(result));
+			
+			ASSERT_OR_FAIL(ThrowingMovable::destroyCount() == 16);
+		}
+		
+		{
+			// Explicit bulk
+			// enqueue
+			ConcurrentQueue<ThrowingMovable, Traits> q;
+			ProducerToken tok(q);
+			
+			ThrowingMovable::reset();
+			std::vector<ThrowingMovable> items;
+			items.reserve(5);
+			items.push_back(ThrowingMovable(1));
+			items.push_back(ThrowingMovable(2));
+			items.push_back(ThrowingMovable(3));
+			items.push_back(ThrowingMovable(4));
+			items.push_back(ThrowingMovable(5));
+			items.back().throwOnCctor = true;
+			
+			bool threw = false;
+			try {
+				q.enqueue_bulk(tok, std::make_move_iterator(items.begin()), 5);
+			}
+			catch (ThrowingMovable* m) {
+				threw = true;
+				ASSERT_OR_FAIL(m->id == 5);
+				ASSERT_OR_FAIL(m->copied);
+			}
+			ASSERT_OR_FAIL(threw);
+			ASSERT_OR_FAIL(q.size_approx() == 0);
+			q.enqueue(tok, ThrowingMovable(6));
+			
+			threw = false;
+			try {
+				q.enqueue_bulk(tok, std::make_move_iterator(items.begin()), 5);
+			}
+			catch (ThrowingMovable* m) {
+				threw = true;
+				ASSERT_OR_FAIL(m->id == 5);
+			}
+			ASSERT_OR_FAIL(threw);
+			ASSERT_OR_FAIL(q.size_approx() == 1);
+			
+			ThrowingMovable result(-1);
+			ASSERT_OR_FAIL(q.try_dequeue(result));
+			ASSERT_OR_FAIL(result.id == 6);
+			ASSERT_OR_FAIL(result.moved);
+			ASSERT_OR_FAIL(!q.try_dequeue(result));
+			
+			ASSERT_OR_FAIL(ThrowingMovable::destroyCount() == 15);
+			
+			// dequeue
+			ThrowingMovable::reset();
+			q.enqueue(tok, ThrowingMovable(10));
+			q.enqueue(tok, ThrowingMovable(11));
+			q.enqueue(tok, ThrowingMovable(12));
+			q.enqueue(tok, ThrowingMovable(13));
+			q.enqueue(tok, ThrowingMovable(14, false, true, true));		// std::back_inserter turns an assignment into a ctor call
+			q.enqueue(tok, ThrowingMovable(15));
+			ASSERT_OR_FAIL(q.size_approx() == 6);
+			
+			std::vector<ThrowingMovable> results;
+			results.reserve(5);
+			ASSERT_OR_FAIL(q.try_dequeue_bulk(std::back_inserter(results), 2));
+			ASSERT_OR_FAIL(results.size() == 2);
+			ASSERT_OR_FAIL(results[0].id == 10);
+			ASSERT_OR_FAIL(results[1].id == 11);
+			ASSERT_OR_FAIL(results[0].moved);
+			ASSERT_OR_FAIL(results[1].moved);
+			ASSERT_OR_FAIL(q.size_approx() == 4);
+			threw = false;
+			try {
+				q.try_dequeue_bulk(std::back_inserter(results), 4);
+			}
+			catch (ThrowingMovable*) {
+				// Note: Can't inspect thrown value since it points to an object whose construction was attempted on the vector and
+				// no longer exists
+				threw = true;
+			}
+			ASSERT_OR_FAIL(threw);
+			ASSERT_OR_FAIL(q.size_approx() == 0);
+			ASSERT_OR_FAIL(!q.try_dequeue(result));
+			ASSERT_OR_FAIL(q.try_dequeue_bulk(std::back_inserter(results), 1) == 0);
+			
+			ASSERT_OR_FAIL(results.size() == 4);
+			ASSERT_OR_FAIL(results[2].id == 12);
+			ASSERT_OR_FAIL(results[3].id == 13);
+			
+			ASSERT_OR_FAIL(ThrowingMovable::destroyCount() == 12);
+		}
+		
+		
+		{
+			// Implicit, basic
+			// enqueue
+			ConcurrentQueue<ThrowingMovable, Traits> q;
+			
+			ThrowingMovable::reset();
+			
+			bool threw = false;
+			try {
+				q.enqueue(ThrowingMovable(1, true));
+			}
+			catch (ThrowingMovable* m) {
+				threw = true;
+				ASSERT_OR_FAIL(m->id == 1);
+				ASSERT_OR_FAIL(m->moved);
+			}
+			ASSERT_OR_FAIL(threw);
+			ASSERT_OR_FAIL(q.size_approx() == 0);
+			
+			ASSERT_OR_FAIL(q.enqueue(ThrowingMovable(2)));
+			ThrowingMovable result(-1);
+			ASSERT_OR_FAIL(q.try_dequeue(result));
+			ASSERT_OR_FAIL(result.id == 2);
+			ASSERT_OR_FAIL(result.moved);
+			ASSERT_OR_FAIL(!q.try_dequeue(result));
+			
+			ASSERT_OR_FAIL(ThrowingMovable::destroyCount() == 3);
+			
+			// dequeue
+			ThrowingMovable::reset();
+			q.enqueue(ThrowingMovable(10));
+			q.enqueue(ThrowingMovable(11, false, true));
+			q.enqueue(ThrowingMovable(12));
+			ASSERT_OR_FAIL(q.size_approx() == 3);
+			
+			ASSERT_OR_FAIL(q.try_dequeue(result));
+			ASSERT_OR_FAIL(result.id == 10);
+			threw = false;
+			try {
+				q.try_dequeue(result);
+			}
+			catch (ThrowingMovable* m) {
+				ASSERT_OR_FAIL(m->id == 11);
+				threw = true;
+			}
+			ASSERT_OR_FAIL(threw);
+			ASSERT_OR_FAIL(q.size_approx() == 1);
+			
+			ASSERT_OR_FAIL(q.try_dequeue(result));
+			ASSERT_OR_FAIL(result.id == 12);
+			ASSERT_OR_FAIL(result.moved);
+			
+			ASSERT_OR_FAIL(!q.try_dequeue(result));
+			q.enqueue(ThrowingMovable(13));
+			ASSERT_OR_FAIL(q.size_approx() == 1);
+			ASSERT_OR_FAIL(q.try_dequeue(result));
+			ASSERT_OR_FAIL(result.id == 13);
+			ASSERT_OR_FAIL(!q.try_dequeue(result));
+			
+			ASSERT_OR_FAIL(ThrowingMovable::destroyCount() == 8);
+		}
+		
+		{
+			// Implicit, on and off block boundaries
+			// enqueue
+			ConcurrentQueue<ThrowingMovable, Traits> q;
+			
+			ThrowingMovable::reset();
+			
+			for (int i = 0; i != 3; ++i) {
+				q.enqueue(ThrowingMovable(i));
+			}
+			bool threw = false;
+			try {
+				q.enqueue(ThrowingMovable(3, true));
+			}
+			catch (ThrowingMovable* m) {
+				threw = true;
+				ASSERT_OR_FAIL(m->id == 3);
+			}
+			ASSERT_OR_FAIL(threw);
+			ASSERT_OR_FAIL(q.size_approx() == 3);
+			
+			q.enqueue(ThrowingMovable(4));
+			threw = false;
+			try {
+				q.enqueue(ThrowingMovable(5, true));
+			}
+			catch (ThrowingMovable* m) {
+				threw = true;
+				ASSERT_OR_FAIL(m->id == 5);
+				ASSERT_OR_FAIL(m->moved);
+			}
+			ASSERT_OR_FAIL(threw);
+			ASSERT_OR_FAIL(q.size_approx() == 4);
+			q.enqueue(ThrowingMovable(6));
+			
+			ThrowingMovable result(-1);
+			ASSERT_OR_FAIL(q.try_dequeue(result));
+			ASSERT_OR_FAIL(result.id == 0);
+			ASSERT_OR_FAIL(q.try_dequeue(result));
+			ASSERT_OR_FAIL(result.id == 1);
+			ASSERT_OR_FAIL(q.try_dequeue(result));
+			ASSERT_OR_FAIL(result.id == 2);
+			ASSERT_OR_FAIL(q.try_dequeue(result));
+			ASSERT_OR_FAIL(result.id == 4);
+			ASSERT_OR_FAIL(q.try_dequeue(result));
+			ASSERT_OR_FAIL(result.id == 6);
+			ASSERT_OR_FAIL(!q.try_dequeue(result));
+			
+			ASSERT_OR_FAIL(ThrowingMovable::destroyCount() == 12);
+			
+			// dequeue
+			ThrowingMovable::reset();
+			q.enqueue(ThrowingMovable(10, false, true));
+			q.enqueue(ThrowingMovable(11));
+			q.enqueue(ThrowingMovable(12));
+			q.enqueue(ThrowingMovable(13, false, true));
+			q.enqueue(ThrowingMovable(14, false, true));
+			q.enqueue(ThrowingMovable(15, false, true));
+			q.enqueue(ThrowingMovable(16));
+			ASSERT_OR_FAIL(q.size_approx() == 7);
+			
+			for (int i = 10; i != 17; ++i) {
+				if (i == 10 || (i >= 13 && i <= 15)) {
+					threw = false;
+					try {
+						q.try_dequeue(result);
+					}
+					catch (ThrowingMovable* m) {
+						ASSERT_OR_FAIL(m->id == i);
+						ASSERT_OR_FAIL(m->moved);
+						threw = true;
+					}
+					ASSERT_OR_FAIL(threw);
+				}
+				else {
+					ASSERT_OR_FAIL(q.try_dequeue(result));
+					ASSERT_OR_FAIL(result.id == i);
+					ASSERT_OR_FAIL(result.moved);
+				}
+				ASSERT_OR_FAIL(q.size_approx() == (std::uint32_t)(16 - i));
+			}
+			
+			ASSERT_OR_FAIL(!q.try_dequeue(result));
+			q.enqueue(ThrowingMovable(20));
+			ASSERT_OR_FAIL(q.size_approx() == 1);
+			ASSERT_OR_FAIL(q.try_dequeue(result));
+			ASSERT_OR_FAIL(result.id == 20);
+			ASSERT_OR_FAIL(!q.try_dequeue(result));
+			
+			ASSERT_OR_FAIL(ThrowingMovable::destroyCount() == 16);
+		}
+		
+		{
+			// Impplicit bulk
+			// enqueue
+			ConcurrentQueue<ThrowingMovable, Traits> q;
+			
+			ThrowingMovable::reset();
+			std::vector<ThrowingMovable> items;
+			items.reserve(5);
+			items.push_back(ThrowingMovable(1));
+			items.push_back(ThrowingMovable(2));
+			items.push_back(ThrowingMovable(3));
+			items.push_back(ThrowingMovable(4));
+			items.push_back(ThrowingMovable(5));
+			items.back().throwOnCctor = true;
+			
+			bool threw = false;
+			try {
+				q.enqueue_bulk(std::make_move_iterator(items.begin()), 5);
+			}
+			catch (ThrowingMovable* m) {
+				threw = true;
+				ASSERT_OR_FAIL(m->id == 5);
+				ASSERT_OR_FAIL(m->copied);
+			}
+			ASSERT_OR_FAIL(threw);
+			ASSERT_OR_FAIL(q.size_approx() == 0);
+			q.enqueue(ThrowingMovable(6));
+			
+			threw = false;
+			try {
+				q.enqueue_bulk(std::make_move_iterator(items.begin()), 5);
+			}
+			catch (ThrowingMovable* m) {
+				threw = true;
+				ASSERT_OR_FAIL(m->id == 5);
+			}
+			ASSERT_OR_FAIL(threw);
+			ASSERT_OR_FAIL(q.size_approx() == 1);
+			
+			ThrowingMovable result(-1);
+			ASSERT_OR_FAIL(q.try_dequeue(result));
+			ASSERT_OR_FAIL(result.id == 6);
+			ASSERT_OR_FAIL(result.moved);
+			ASSERT_OR_FAIL(!q.try_dequeue(result));
+			
+			ASSERT_OR_FAIL(ThrowingMovable::destroyCount() == 15);
+			
+			// dequeue
+			ThrowingMovable::reset();
+			q.enqueue(ThrowingMovable(10));
+			q.enqueue(ThrowingMovable(11));
+			q.enqueue(ThrowingMovable(12));
+			q.enqueue(ThrowingMovable(13));
+			q.enqueue(ThrowingMovable(14, false, true, true));		// std::back_inserter turns an assignment into a ctor call
+			q.enqueue(ThrowingMovable(15));
+			ASSERT_OR_FAIL(q.size_approx() == 6);
+			
+			std::vector<ThrowingMovable> results;
+			results.reserve(5);
+			ASSERT_OR_FAIL(q.try_dequeue_bulk(std::back_inserter(results), 2));
+			ASSERT_OR_FAIL(results.size() == 2);
+			ASSERT_OR_FAIL(results[0].id == 10);
+			ASSERT_OR_FAIL(results[1].id == 11);
+			ASSERT_OR_FAIL(results[0].moved);
+			ASSERT_OR_FAIL(results[1].moved);
+			ASSERT_OR_FAIL(q.size_approx() == 4);
+			threw = false;
+			try {
+				q.try_dequeue_bulk(std::back_inserter(results), 4);
+			}
+			catch (ThrowingMovable*) {
+				threw = true;
+			}
+			ASSERT_OR_FAIL(threw);
+			ASSERT_OR_FAIL(q.size_approx() == 0);
+			ASSERT_OR_FAIL(!q.try_dequeue(result));
+			ASSERT_OR_FAIL(q.try_dequeue_bulk(std::back_inserter(results), 1) == 0);
+			
+			ASSERT_OR_FAIL(results.size() == 4);
+			ASSERT_OR_FAIL(results[2].id == 12);
+			ASSERT_OR_FAIL(results[3].id == 13);
+			
+			ASSERT_OR_FAIL(ThrowingMovable::destroyCount() == 12);
+		}
+		
+		{
+			// Threaded
+			ConcurrentQueue<ThrowingMovable, Traits> q;
+			ThrowingMovable::reset();
+			
+			std::vector<SimpleThread> threads(6);
+			for (std::size_t tid = 0; tid != threads.size(); ++tid) {
+				threads[tid] = SimpleThread([&](std::size_t tid) {
+					std::vector<ThrowingMovable> inVec;
+					inVec.push_back(ThrowingMovable(1));
+					inVec.push_back(ThrowingMovable(2));
+					inVec.push_back(ThrowingMovable(3));
+					
+					std::vector<ThrowingMovable> outVec;
+					outVec.push_back(ThrowingMovable(-1));
+					outVec.push_back(ThrowingMovable(-1));
+					outVec.push_back(ThrowingMovable(-1));
+					
+					ProducerToken tok(q);
+					ThrowingMovable result(-1);
+					
+					for (std::size_t i = 0; i != 8192; ++i) {
+						auto magic = (tid + 1) * i + tid * 17 + i;
+						auto op = magic & 7;
+						auto ctorThrow = (magic & 0x10) != 0;
+						auto assignThrow = (magic & 0x20) != 0;
+						auto throwOnNextCctor = (magic & 0x40) != 0;
+						try {
+							switch (op) {
+							case 0:
+								q.enqueue(tok, ThrowingMovable((int)i, ctorThrow, assignThrow, throwOnNextCctor));
+								break;
+							case 1:
+								inVec[i & 3].throwOnCctor = ctorThrow;
+								inVec[i & 3].throwOnAssignment = assignThrow;
+								inVec[i & 3].throwOnSecondCctor = throwOnNextCctor;
+								q.enqueue_bulk(tok, inVec.begin(), 3);
+								break;
+							case 2:
+								q.enqueue(ThrowingMovable((int)i, ctorThrow, assignThrow, throwOnNextCctor));
+								break;
+							case 3:
+								inVec[i & 3].throwOnCctor = ctorThrow;
+								inVec[i & 3].throwOnAssignment = assignThrow;
+								inVec[i & 3].throwOnSecondCctor = throwOnNextCctor;
+								q.enqueue_bulk(inVec.begin(), 3);
+								break;
+							case 4:
+							case 5:
+								q.try_dequeue(result);
+								break;
+							case 6:
+							case 7:
+								q.try_dequeue_bulk(outVec.data(), 3);
+								break;
+							}
+						}
+						catch (ThrowingMovable*) {
+						}
+					}
+				}, tid);
+			}
+			for (std::size_t i = 0; i != threads.size(); ++i) {
+				threads[i].join();
+			}
+			
+			ThrowingMovable result(-1);
+			while (true) {
+				try {
+					if (!q.try_dequeue(result)) {
+						break;
+					}
+				}
+				catch (ThrowingMovable*) {
+				}
+			}
+			
+			ASSERT_OR_FAIL(ThrowingMovable::destroyCount() + 1 == ThrowingMovable::ctorCount());
 		}
 		
 		return true;
@@ -2131,7 +3017,7 @@ public:
 			ASSERT_OR_FAIL(success[1]);
 		}
 		
-		// Enqueue bulk (while somebody is dequeueing (with tokens)
+		// Enqueue bulk (while somebody is dequeueing (with tokens))
 		Traits::reset();
 		{
 			ConcurrentQueue<int, Traits> q;
@@ -2612,7 +3498,7 @@ public:
 		
 		// moving
 		{
-			ConcurrentQueue<int> q(4);
+			ConcurrentQueue<int, MallocTrackingTraits> q(4);
 			ProducerToken t(q);
 			for (int i = 0; i != 1233; ++i) {
 				q.enqueue(i);
@@ -2622,7 +3508,7 @@ public:
 			}
 			ASSERT_OR_FAIL(q.size_approx() == 5677);
 			
-			ConcurrentQueue<int> q2(std::move(q));
+			ConcurrentQueue<int, MallocTrackingTraits> q2(std::move(q));
 			ASSERT_OR_FAIL(q.size_approx() == 0);
 			ASSERT_OR_FAIL(q2.size_approx() == 5677);
 			
@@ -2653,7 +3539,7 @@ public:
 		
 		// swapping
 		{
-			ConcurrentQueue<int> q1, q2, q3;
+			ConcurrentQueue<int, MallocTrackingTraits> q1, q2, q3;
 			ProducerToken t1(q1), t2(q2), t3(q3);
 			
 			for (int i = 1234; i != 5678; ++i) {
@@ -2677,7 +3563,7 @@ public:
 			}
 			
 			{
-				ConcurrentQueue<int> temp;
+				ConcurrentQueue<int, MallocTrackingTraits> temp;
 				temp = std::move(q1);
 				q1 = std::move(q2);
 				q2 = std::move(temp);
@@ -2712,6 +3598,415 @@ public:
 			}
 			ASSERT_OR_FAIL(!q3.try_dequeue_non_interleaved(item));
 			ASSERT_OR_FAIL(q3.size_approx() == 0);
+		}
+		
+		return true;
+	}
+	
+	
+	bool blocking_wrappers()
+	{
+		typedef BlockingConcurrentQueue<int, MallocTrackingTraits> Q;
+		ASSERT_OR_FAIL((Q::is_lock_free() == ConcurrentQueue<int, MallocTrackingTraits>::is_lock_free()));
+		
+		// Moving
+		{
+			Q a, b, c;
+			a = std::move(b);
+			b = std::move(c);
+			a = std::move(a);
+			c = std::move(b);
+			b = Q(std::move(b));
+			using std::swap;
+			swap(a, b);
+			a.swap(c);
+			c.swap(c);
+		}
+		
+		// Implicit
+		{
+			Q q;
+			ASSERT_OR_FAIL(q.enqueue(1));
+			ASSERT_OR_FAIL(q.size_approx() == 1);
+			int item;
+			ASSERT_OR_FAIL(q.try_dequeue(item));
+			ASSERT_OR_FAIL(item == 1);
+			ASSERT_OR_FAIL(!q.try_dequeue(item));
+			ASSERT_OR_FAIL(q.size_approx() == 0);
+			
+			ASSERT_OR_FAIL(q.enqueue(2));
+			ASSERT_OR_FAIL(q.enqueue(3));
+			ASSERT_OR_FAIL(q.size_approx() == 2);
+			q.wait_dequeue(item);
+			ASSERT_OR_FAIL(item == 2);
+			ASSERT_OR_FAIL(q.size_approx() == 1);
+			q.wait_dequeue(item);
+			ASSERT_OR_FAIL(item == 3);
+			ASSERT_OR_FAIL(!q.try_dequeue(item));
+			ASSERT_OR_FAIL(q.size_approx() == 0);
+		}
+		
+		// Implicit threaded
+		{
+			Q q;
+			const int THREADS = 8;
+			SimpleThread threads[THREADS];
+			bool success[THREADS];
+			
+			for (int i = 0; i != THREADS; ++i) {
+				success[i] = true;
+				
+				if (i % 2 == 0) {
+					// Enqueue
+					if (i % 4 == 0) {
+						threads[i] = SimpleThread([&](int j) {
+							int stuff[5];
+							for (int k = 0; k != 2048; ++k) {
+								for (int x = 0; x != 5; ++x) {
+									stuff[x] = (j << 16) | (k * 5 + x);
+								}
+								success[j] = q.enqueue_bulk(stuff, 5) && success[j];
+							}
+						}, i);
+					}
+					else {
+						threads[i] = SimpleThread([&](int j) {
+							for (int k = 0; k != 4096; ++k) {
+								success[j] = q.enqueue((j << 16) | k) && success[j];
+							}
+						}, i);
+					}
+				}
+				else {
+					// Dequeue
+					threads[i] = SimpleThread([&](int j) {
+						int item;
+						std::vector<int> prevItems(THREADS, -1);
+						if (j % 4 == 1) {
+							for (int k = 0; k != 2048 * 5; ++k) {
+								if (q.try_dequeue(item)) {
+									int thread = item >> 16;
+									item &= 0xffff;
+									if (item <= prevItems[thread]) {
+										success[j] = false;
+									}
+									prevItems[thread] = item;
+								}
+							}
+						}
+						else {
+							int items[6];
+							for (int k = 0; k < 4096;  ++k) {
+								if (std::size_t dequeued = q.try_dequeue_bulk(items, 6)) {
+									for (std::size_t x = 0; x != dequeued; ++x) {
+										item = items[x];
+										int thread = item >> 16;
+										item &= 0xffff;
+										if (item <= prevItems[thread]) {
+											success[j] = false;
+										}
+										prevItems[thread] = item;
+									}
+								}
+							}
+						}
+					}, i);
+				}
+			}
+			for (int i = 0; i != THREADS; ++i) {
+				threads[i].join();
+			}
+			
+			for (int i = 0; i != THREADS; ++i) {
+				ASSERT_OR_FAIL(success[i]);
+			}
+		}
+		
+		// Implicit threaded, blocking
+		{
+			Q q;
+			const int THREADS = 8;
+			SimpleThread threads[THREADS];
+			bool success[THREADS];
+			
+			for (int i = 0; i != THREADS; ++i) {
+				success[i] = true;
+				
+				if (i % 2 == 0) {
+					// Enqueue
+					if (i % 4 == 0) {
+						threads[i] = SimpleThread([&](int j) {
+							int stuff[5];
+							for (int k = 0; k != 2048; ++k) {
+								for (int x = 0; x != 5; ++x) {
+									stuff[x] = (j << 16) | (k * 5 + x);
+								}
+								success[j] = q.enqueue_bulk(stuff, 5) && success[j];
+							}
+						}, i);
+					}
+					else {
+						threads[i] = SimpleThread([&](int j) {
+							for (int k = 0; k != 4096; ++k) {
+								success[j] = q.enqueue((j << 16) | k) && success[j];
+							}
+						}, i);
+					}
+				}
+				else {
+					// Dequeue
+					threads[i] = SimpleThread([&](int j) {
+						int item;
+						std::vector<int> prevItems(THREADS, -1);
+						if (j % 4 == 1) {
+							for (int k = 0; k != 2048 * 5; ++k) {
+								q.wait_dequeue(item);
+								int thread = item >> 16;
+								item &= 0xffff;
+								if (item <= prevItems[thread]) {
+									success[j] = false;
+								}
+								prevItems[thread] = item;
+							}
+						}
+						else {
+							int items[6];
+							int k;
+							for (k = 0; k < 4090; ) {
+								if (std::size_t dequeued = q.wait_dequeue_bulk(items, 6)) {
+									for (std::size_t x = 0; x != dequeued; ++x) {
+										item = items[x];
+										int thread = item >> 16;
+										item &= 0xffff;
+										if (item <= prevItems[thread]) {
+											success[j] = false;
+										}
+										prevItems[thread] = item;
+									}
+									k += (int)dequeued;
+								}
+								else {
+									success[j] = false;
+								}
+							}
+							for (; k != 4096; ++k) {
+								q.wait_dequeue(item);
+								int thread = item >> 16;
+								item &= 0xffff;
+								if (item <= prevItems[thread]) {
+									success[j] = false;
+								}
+								prevItems[thread] = item;
+							}
+						}
+					}, i);
+				}
+			}
+			for (int i = 0; i != THREADS; ++i) {
+				threads[i].join();
+			}
+			
+			for (int i = 0; i != THREADS; ++i) {
+				ASSERT_OR_FAIL(success[i]);
+			}
+			ASSERT_OR_FAIL(q.size_approx() == 0);
+		}
+		
+		// Explicit
+		{
+			Q q;
+			ProducerToken pt(q);
+			ASSERT_OR_FAIL(q.enqueue(pt, 1));
+			ASSERT_OR_FAIL(q.size_approx() == 1);
+			int item;
+			ConsumerToken ct(q);
+			ASSERT_OR_FAIL(q.try_dequeue(ct, item));
+			ASSERT_OR_FAIL(item == 1);
+			ASSERT_OR_FAIL(!q.try_dequeue(ct, item));
+			ASSERT_OR_FAIL(q.size_approx() == 0);
+			
+			ASSERT_OR_FAIL(q.enqueue(pt, 2));
+			ASSERT_OR_FAIL(q.enqueue(pt, 3));
+			ASSERT_OR_FAIL(q.size_approx() == 2);
+			q.wait_dequeue(ct, item);
+			ASSERT_OR_FAIL(item == 2);
+			ASSERT_OR_FAIL(q.size_approx() == 1);
+			q.wait_dequeue(ct, item);
+			ASSERT_OR_FAIL(item == 3);
+			ASSERT_OR_FAIL(!q.try_dequeue(ct, item));
+			ASSERT_OR_FAIL(q.size_approx() == 0);
+		}
+		
+		// Explicit threaded
+		{
+			Q q;
+			const int THREADS = 8;
+			SimpleThread threads[THREADS];
+			bool success[THREADS];
+			
+			for (int i = 0; i != THREADS; ++i) {
+				success[i] = true;
+				
+				if (i % 2 == 0) {
+					// Enqueue
+					if (i % 4 == 0) {
+						threads[i] = SimpleThread([&](int j) {
+							ProducerToken t(q);
+							int stuff[5];
+							for (int k = 0; k != 2048; ++k) {
+								for (int x = 0; x != 5; ++x) {
+									stuff[x] = (j << 16) | (k * 5 + x);
+								}
+								success[j] = q.enqueue_bulk(t, stuff, 5) && success[j];
+							}
+						}, i);
+					}
+					else {
+						threads[i] = SimpleThread([&](int j) {
+							ProducerToken t(q);
+							for (int k = 0; k != 4096; ++k) {
+								success[j] = q.enqueue(t, (j << 16) | k) && success[j];
+							}
+						}, i);
+					}
+				}
+				else {
+					// Dequeue
+					threads[i] = SimpleThread([&](int j) {
+						ConsumerToken t(q);
+						int item;
+						std::vector<int> prevItems(THREADS, -1);
+						if (j % 4 == 1) {
+							for (int k = 0; k != 2048 * 5; ++k) {
+								if (q.try_dequeue(t, item)) {
+									int thread = item >> 16;
+									item &= 0xffff;
+									if (item <= prevItems[thread]) {
+										success[j] = false;
+									}
+									prevItems[thread] = item;
+								}
+							}
+						}
+						else {
+							int items[6];
+							for (int k = 0; k < 4096;  ++k) {
+								if (std::size_t dequeued = q.try_dequeue_bulk(t, items, 6)) {
+									for (std::size_t x = 0; x != dequeued; ++x) {
+										item = items[x];
+										int thread = item >> 16;
+										item &= 0xffff;
+										if (item <= prevItems[thread]) {
+											success[j] = false;
+										}
+										prevItems[thread] = item;
+									}
+								}
+							}
+						}
+					}, i);
+				}
+			}
+			for (int i = 0; i != THREADS; ++i) {
+				threads[i].join();
+			}
+			
+			for (int i = 0; i != THREADS; ++i) {
+				ASSERT_OR_FAIL(success[i]);
+			}
+		}
+		
+		// Explicit threaded, blocking
+		{
+			Q q;
+			const int THREADS = 8;
+			SimpleThread threads[THREADS];
+			bool success[THREADS];
+			
+			for (int i = 0; i != THREADS; ++i) {
+				success[i] = true;
+				
+				if (i % 2 == 0) {
+					// Enqueue
+					if (i % 4 == 0) {
+						threads[i] = SimpleThread([&](int j) {
+							ProducerToken t(q);
+							int stuff[5];
+							for (int k = 0; k != 2048; ++k) {
+								for (int x = 0; x != 5; ++x) {
+									stuff[x] = (j << 16) | (k * 5 + x);
+								}
+								success[j] = q.enqueue_bulk(t, stuff, 5) && success[j];
+							}
+						}, i);
+					}
+					else {
+						threads[i] = SimpleThread([&](int j) {
+							ProducerToken t(q);
+							for (int k = 0; k != 4096; ++k) {
+								success[j] = q.enqueue(t, (j << 16) | k) && success[j];
+							}
+						}, i);
+					}
+				}
+				else {
+					// Dequeue
+					threads[i] = SimpleThread([&](int j) {
+						ConsumerToken t(q);
+						int item;
+						std::vector<int> prevItems(THREADS, -1);
+						if (j % 4 == 1) {
+							for (int k = 0; k != 2048 * 5; ++k) {
+								q.wait_dequeue(t, item);
+								int thread = item >> 16;
+								item &= 0xffff;
+								if (item <= prevItems[thread]) {
+									success[j] = false;
+								}
+								prevItems[thread] = item;
+							}
+						}
+						else {
+							int items[6];
+							int k;
+							for (k = 0; k < 4090; ) {
+								if (std::size_t dequeued = q.wait_dequeue_bulk(t, items, 6)) {
+									for (std::size_t x = 0; x != dequeued; ++x) {
+										item = items[x];
+										int thread = item >> 16;
+										item &= 0xffff;
+										if (item <= prevItems[thread]) {
+											success[j] = false;
+										}
+										prevItems[thread] = item;
+									}
+									k += (int)dequeued;
+								}
+								else {
+									success[j] = false;
+								}
+							}
+							for (; k != 4096; ++k) {
+								q.wait_dequeue(t, item);
+								int thread = item >> 16;
+								item &= 0xffff;
+								if (item <= prevItems[thread]) {
+									success[j] = false;
+								}
+								prevItems[thread] = item;
+							}
+						}
+					}, i);
+				}
+			}
+			for (int i = 0; i != THREADS; ++i) {
+				threads[i].join();
+			}
+			
+			for (int i = 0; i != THREADS; ++i) {
+				ASSERT_OR_FAIL(success[i]);
+			}
+			ASSERT_OR_FAIL(q.size_approx() == 0);
 		}
 		
 		return true;
@@ -2980,8 +4275,8 @@ public:
 				
 				const int MAX_ENTRIES = 4096;
 				std::vector<int> values(MAX_ENTRIES);
-				std::vector<std::atomic<int>> useCounts(MAX_ENTRIES);
-				std::vector<std::atomic<bool>> removed(MAX_ENTRIES);
+				std::array<std::atomic<int>, MAX_ENTRIES> useCounts;
+				std::array<std::atomic<bool>, MAX_ENTRIES> removed;
 				
 				for (std::size_t i = 0; i != useCounts.size(); ++i) {
 					useCounts[i].store(0, std::memory_order_relaxed);
@@ -3055,6 +4350,37 @@ public:
 				ASSERT_OR_FAIL(hash.remove(MAX_ENTRIES) == nullptr);
 			}
 		}
+		return true;
+	}
+	
+	bool explicit_strings_threaded()
+	{
+		std::vector<SimpleThread> threads(8);
+		ConcurrentQueue<std::string, MallocTrackingTraits> q(1024 * 1024);
+		
+		for (size_t tid = 0; tid != threads.size(); ++tid) {
+			threads[tid] = SimpleThread([&](size_t tid) {
+				const size_t ITERATIONS = 100 * 1024;
+				if (tid % 2 == 0) {
+					// Produce
+					ProducerToken t(q);
+					for (size_t i = 0; i != ITERATIONS; ++i) {
+						q.enqueue(t, std::string("banana", i % 6));
+					}
+				}
+				else {
+					// Consume
+					std::string item;
+					for (size_t i = 0; i != ITERATIONS / 2; ++i) {
+						q.try_dequeue(item);
+					}
+				}
+			}, tid);
+		}
+		for (size_t tid = 0; tid != threads.size(); ++tid) {
+			threads[tid].join();
+		}
+		
 		return true;
 	}
 };

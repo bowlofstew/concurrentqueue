@@ -20,6 +20,7 @@
 #include <cassert>
 #include <thread>
 #include <algorithm>
+#include <cctype>
 
 #include "../concurrentqueue.h"
 #include "lockbasedqueue.h"
@@ -436,7 +437,7 @@ double runBenchmark(benchmark_type_t benchmark, int nthreads, bool useTokens, un
 				
 				int item;
 				SystemTime start;
-				RNG_t rng(randSeed * id);
+				RNG_t rng(randSeed * (id + 1));
 				std::uniform_int_distribution<int> rand(0, 20);
 				ops[id] = 0;
 				times[id] = 0;
@@ -1690,12 +1691,21 @@ static const char* pretty(double num)
 {
 	assert(num >= 0);
 	
+#if defined(_MSC_VER) && _MSC_VER < 1800
+	if (!_finite(num)) {
+		return "inf";
+	}
+	if (_isnan(num)) {
+		return "nan";
+	}
+#else
 	if (std::isinf(num)) {
 		return "inf";
 	}
 	if (std::isnan(num)) {
 		return "nan";
 	}
+#endif
 	
 	static char bufs[16][8];
 	static int nextBuf = 0;
@@ -1860,7 +1870,7 @@ int main(int argc, char** argv)
 	std::srand(std::time(NULL));
 	unsigned int randSeeds[BENCHMARK_TYPE_COUNT];
 	for (unsigned int i = 0; i != BENCHMARK_TYPE_COUNT; ++i) {
-		randSeeds[i] = std::rand() * i;
+		randSeeds[i] = std::rand() * (i + 1) + 1;
 	}
 	
 	double opsst = 0;		// ops/s/thread
